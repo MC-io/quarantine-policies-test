@@ -1,0 +1,86 @@
+name: IAM account quarantine
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "quarantine = add deny-all to every user/group/role, release = remove it"
+        type: choice
+        options:
+          - quarantine
+          - release
+        required: true
+      confirm_account_id:
+        description: "Type the target AWS account ID to confirm"
+        type: string
+        required: true
+      dry_run:
+        description: "Dry run (only report what would change)"
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write   # required for AWS OIDC
+  contents: read
+
+# Never let a quarantine and a release run at the same time.
+concurrency:
+  group: iam-quarantine
+  cancel-in-progress: false
+
+jobs:
+  iam-quarantine:
+    runs-on: ubuntu-latest
+    # Add required reviewers to this environment in GitHub settings.
+    environment: security-quarantine
+    env:
+      ACTION: ${{ inputs.action }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      CONFIRM_ACCOUNT_ID: ${{ inputs.confirm_account_id }}
+      ACCOUNT_ID: ${{ vars.QUARANTINE_ACCOUNT_ID }}
+      ROLE_NAME: ${{ vars.QUARANTINE_ROLE_NAME }}
+      # Comma-separated names that must never be quarantined
+      # (break-glass, logging/security roles...). The role this workflow
+      # assumes is always excluded automatically.
+      EXCLUDED_ROLES: ${{ vars.QUARANTINE_EXCLUDED_ROLES }}
+      EXCLUDED_USERS: ${{ vars.QUARANTINE_EXCLUDED_USERS }}
+      EXCLUDED_GROUPS: ${{ vars.QUARANTINE_EXCLUDED_GROUPS }}
+
+    steps:
+      - name: Validate inputs
+        run: |
+          if [ -z "$ACCOUNT_ID" ] || [ -z "$ROLE_NAME" ]; then
+            echo "::error::Set QUARANTINE_ACCOUNT_ID and QUARANTINE_ROLE_NAME repository/environment variables."
+            exit 1
+          fi
+          if [ "$CONFIRM_ACCOUNT_ID" != "$ACCOUNT_ID" ]; then
+            echo "::error::Confirmation account ID does not match the configured account."
+            exit 1
+          fi
+          echo "Action: $ACTION | Account: $ACCOUNT_ID | Dry run: $DRY_RUN"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.QUARANTINE_ACCOUNT_ID }}:role/${{ vars.QUARANTINE_ROLE_NAME }}
+          role-session-name: iam-${{ inputs.action }}-${{ github.run_id }}
+          aws-region: us-east-1   # IAM is global; any region works
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install --quiet boto3
+
+      - name: Run ${{ inputs.action }}
+        run: |
+          EXTRA=""
+          if [ "$DRY_RUN" = "true" ]; then EXTRA="--dry-run"; fi
+          python scripts/iam_quarantine.py "$ACTION" --account-id "$ACCOUNT_ID" $EXTRA
