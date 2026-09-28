@@ -7,6 +7,10 @@ the account, except:
     still run afterward)
   - AWS service-linked roles (path starts with /aws-service-role/): quarantining one
     can break AWS's own account-level functionality (Support, Trusted Advisor, etc.)
+  - IAM Identity Center permission-set roles (path starts with /aws-reserved/): AWS
+    rejects PutRolePolicy on these outright (UnmodifiableEntity), so they are skipped
+    and the run ends with a warning. SSO access is therefore NOT revoked by a
+    quarantine — see the note below.
   - anything explicitly named in --exclude-roles / --exclude-users / --exclude-groups
     (break-glass identities, logging/security roles)
   - a group whose membership includes an excluded user (denying the group would deny
@@ -89,21 +93,36 @@ def _log(action, kind, name, dry_run, reason=None):
 
 
 def _apply_deny_all(put_fn, delete_fn, name_kwarg, name, action, dry_run):
+    """Attach or remove the deny-all policy. True if AWS accepted the call."""
     if dry_run:
-        return
-    if action == "quarantine":
-        put_fn(**{name_kwarg: name}, PolicyName=DENY_ALL_POLICY_NAME, PolicyDocument=DENY_ALL_POLICY_DOCUMENT)
-    else:
-        try:
+        return True
+    try:
+        if action == "quarantine":
+            put_fn(**{name_kwarg: name}, PolicyName=DENY_ALL_POLICY_NAME, PolicyDocument=DENY_ALL_POLICY_DOCUMENT)
+        else:
             delete_fn(**{name_kwarg: name}, PolicyName=DENY_ALL_POLICY_NAME)
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "NoSuchEntity":
-                raise
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        # release: the policy was never attached, or is already gone. quarantine: the
+        # identity was deleted between list and write. Both are no-ops, not failures.
+        if code == "NoSuchEntity":
+            return True
+        # AWS-protected identities (IAM Identity Center permission-set roles and the
+        # like) reject writes outright. Never let one abort the run: a crash mid-pass
+        # leaves the account PARTIALLY quarantined, which is harder to reason about
+        # than an incomplete pass that reported every identity it could not touch.
+        if code == "UnmodifiableEntity":
+            print(f"    ! AWS refuses to modify {name}: {e.response['Error']['Message']}")
+            return False
+        raise
+    return True
 
 
 def process_roles(iam, action, excluded, dry_run):
+    """Returns the IAM Identity Center roles that were skipped, for the final warning."""
     roles = _list_all(iam, "list_roles", "Roles")
     print(f"Roles: {len(roles)} total, {len(excluded)} excluded")
+    sso_skipped = []
     for role in roles:
         name = role["RoleName"]
         # Exclusion only suppresses quarantine; release always tries to remove the
@@ -112,11 +131,22 @@ def process_roles(iam, action, excluded, dry_run):
         if action == "quarantine" and name in excluded:
             _log(action, "role", name, dry_run, reason="excluded")
             continue
-        if role.get("Path", "/").startswith("/aws-service-role/"):
+        path = role.get("Path", "/")
+        if path.startswith("/aws-service-role/"):
             _log(action, "role", name, dry_run, reason="AWS service-linked role")
+            continue
+        # IAM Identity Center (SSO) permission-set roles live under /aws-reserved/ and
+        # are writable only by AWS: PutRolePolicy returns UnmodifiableEntity. They
+        # cannot be quarantined through IAM at all, which is why the docstring says
+        # this script does not cover Identity Center — revoking SSO means disabling
+        # the instance or removing assignments, outside this script's scope.
+        if path.startswith("/aws-reserved/"):
+            sso_skipped.append(name)
+            _log(action, "role", name, dry_run, reason="IAM Identity Center role, not modifiable via IAM")
             continue
         _log(action, "role", name, dry_run)
         _apply_deny_all(iam.put_role_policy, iam.delete_role_policy, "RoleName", name, action, dry_run)
+    return sso_skipped
 
 
 def process_users(iam, action, excluded, dry_run):
@@ -174,11 +204,22 @@ def main():
 
     iam = boto3.client("iam")
 
-    process_roles(iam, args.action, excluded_roles, args.dry_run)
+    sso_skipped = process_roles(iam, args.action, excluded_roles, args.dry_run)
     process_users(iam, args.action, excluded_users, args.dry_run)
     process_groups(iam, args.action, excluded_groups, excluded_users, args.dry_run)
 
     print(f"Done: {args.action}{' (dry run, nothing changed)' if args.dry_run else ''}")
+
+    # Say this loudly: if humans reach this account through Identity Center, a
+    # "successful" quarantine has NOT cut off their access, and reading the run as
+    # "account locked down" would be wrong.
+    if sso_skipped and args.action == "quarantine":
+        print(
+            f"::warning::{len(sso_skipped)} IAM Identity Center role(s) could not be quarantined "
+            f"({', '.join(sorted(sso_skipped)[:5])}"
+            f"{', ...' if len(sso_skipped) > 5 else ''}). SSO access to this account is UNAFFECTED. "
+            "To revoke it, disable the Identity Center instance or remove its account assignments."
+        )
 
 
 if __name__ == "__main__":
